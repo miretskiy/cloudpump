@@ -6,7 +6,7 @@
 //   - BenchmarkDownload        cloudpump, best scheduler (io_uring on Linux)
 //   - BenchmarkDownloadPwrite  cloudpump, forced pwrite(2) — isolates io_uring benefit
 //   - BenchmarkDownloadSerial  cloudpump, j=1 — isolates O_DIRECT + mmap benefit
-//   - BenchmarkDownloadNaive   single GetObject → io.Copy → os.Create + Sync baseline
+//   - BenchmarkDownloadNaive   AWS manager.Downloader (parallel, heap buffers, page cache)
 //
 // Every benchmark reports:
 //   - MB/s via b.SetBytes
@@ -14,13 +14,20 @@
 //   - process-level CPU time via getrusage(RUSAGE_SELF): cpu-usr-ms/op, cpu-sys-ms/op
 //   - io_uring batch stats where applicable: uring-avg-batch, uring-max-batch
 //
-// # Fairness note
+// # What BenchmarkDownloadNaive measures
 //
-// BenchmarkDownloadNaive calls f.Sync() before Close(). Without it, the OS
-// defers NVMe writes to after the benchmark timer stops (data sits in the
-// dirty page cache). Sync() forces the NVMe write inline so both cloudpump
-// (O_DIRECT, always synchronous to NVMe) and naive measure the same thing:
-// time until the file is durably on disk.
+// The "naive" baseline uses aws-sdk-go-v2's manager.Downloader configured with
+// the same concurrency (GOMAXPROCS) and chunk size (4 MiB) as cloudpump. The
+// HTTP transport is also identical. The only differences are:
+//
+//   - I/O path: manager writes via f.WriteAt (buffered, page cache) vs
+//     cloudpump's O_DIRECT pwrite/io_uring (bypasses page cache)
+//   - Memory: manager allocates heap buffers per chunk (GC-visible) vs
+//     cloudpump's pre-allocated mmap slabs (GC-invisible)
+//   - Pre-allocation: no Fallocate vs cloudpump's upfront extent reservation
+//
+// f.Sync() is called after the download so both benchmarks measure the same
+// endpoint: data durably on NVMe (not merely in the dirty page cache).
 //
 // Suggested remote run:
 //
@@ -32,11 +39,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -44,6 +51,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	cloudpump "github.com/miretskiy/cloudpump"
@@ -103,8 +111,11 @@ var (
 	uringS3  *awss3.Client
 	pwriteS3 *awss3.Client
 
-	// naiveS3 uses the SDK's default http.Client — no tuning.
-	naiveS3 *awss3.Client
+	// naiveS3 uses the same tuned transport as uringS3 so the HTTP path is
+	// identical. The only difference versus cloudpump is the I/O path:
+	// manager.Downloader writes through the page cache with heap buffers.
+	naiveS3         *awss3.Client
+	naiveDownloader *s3manager.Downloader
 
 	benchDir     string
 	benchTempDir bool
@@ -190,7 +201,18 @@ func setupBench() int {
 	pwriteS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
 		o.HTTPClient = pwriteEngine.HTTPClient()
 	})
-	naiveS3 = awss3.NewFromConfig(cfg) // default transport, no tuning
+	// naiveS3 shares the engine's tuned HTTP transport so the comparison
+	// isolates I/O path (page cache vs O_DIRECT) not transport config.
+	naiveS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
+		o.HTTPClient = uringEngine.HTTPClient()
+	})
+	// naiveDownloader mirrors cloudpump's parallelism and chunk size so
+	// the only variables are: heap allocations vs mmap slabs, page-cache
+	// writes vs O_DIRECT, and no Fallocate vs upfront extent reservation.
+	naiveDownloader = s3manager.NewDownloader(naiveS3, func(d *s3manager.Downloader) {
+		d.PartSize    = int64(4 << 20)           // match cloudpump's chunk size
+		d.Concurrency = runtime.GOMAXPROCS(0)    // match cloudpump's worker count
+	})
 
 	return 0
 }
@@ -253,6 +275,7 @@ func BenchmarkDownloadNaive(b *testing.B) {
 		bf := bf
 		b.Run(bf.name, func(b *testing.B) {
 			size := headObject(b, naiveS3, bf.key)
+			naiveDownloadKey = bf.key // thread key to naiveDownload via package var
 			b.SetBytes(size)
 			mon := startVmstat()
 			ru0 := getrusage()
@@ -260,7 +283,7 @@ func BenchmarkDownloadNaive(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				dst := dstPath(bf.name, "naive", i)
-				if err := naiveDownload(context.Background(), naiveS3, benchBucket, bf.key, dst); err != nil {
+				if err := naiveDownload(context.Background(), dst); err != nil {
 					b.Fatal(err)
 				}
 				mustRemove(b, dst)
@@ -319,30 +342,33 @@ func runDownloadBench(
 
 // ─── naiveDownload ────────────────────────────────────────────────────────────
 
-func naiveDownload(ctx context.Context, client *awss3.Client, bucket, key, dst string) error {
-	resp, err := client.GetObject(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return fmt.Errorf("GetObject: %w", err)
-	}
-	defer resp.Body.Close()
+// naiveDownload uses manager.Downloader with the same concurrency and chunk
+// size as cloudpump. The manager writes via f.WriteAt — buffered page-cache
+// writes — whereas cloudpump uses O_DIRECT. This isolates the I/O path
+// difference with all other variables (HTTP transport, parallelism, chunk
+// size) held constant.
+//
+// f.Sync() is called so the benchmark measures time until data is on NVMe,
+// not merely time until dirty pages are in the kernel's page cache.
+func naiveDownload(ctx context.Context, dst string) error {
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if _, err = io.Copy(f, resp.Body); err != nil {
-		return err
+	if _, err = naiveDownloader.Download(ctx, f, &awss3.GetObjectInput{
+		Bucket: aws.String(benchBucket),
+		Key:    aws.String(naiveDownloadKey),
+	}); err != nil {
+		return fmt.Errorf("manager.Download: %w", err)
 	}
-	// Sync flushes dirty pages to NVMe before returning so the benchmark
-	// measures the same thing as cloudpump's O_DIRECT writes: time until
-	// data is durably on disk. Without Sync, the OS defers the NVMe write
-	// to after the benchmark timer stops, making naive appear faster than
-	// it really is (it was measuring "time to fill page cache", not NVMe).
 	return f.Sync()
 }
+
+// naiveDownloadKey is set by BenchmarkDownloadNaive before each sub-benchmark.
+// The manager.Downloader doesn't take the key at construction time, so we
+// thread it through a package-level variable (benchmarks are not concurrent).
+var naiveDownloadKey string
 
 // ─── vmstat monitor ───────────────────────────────────────────────────────────
 
