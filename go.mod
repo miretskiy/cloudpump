@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.11
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.3
-	github.com/miretskiy/dio v0.0.0
+	github.com/miretskiy/dio v0.0.0-20260304163557-43c87577baae
 	golang.org/x/sync v0.8.0
 	google.golang.org/api v0.187.0
 )
@@ -63,9 +63,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240624140628-dc46fd24d27d // indirect
 	google.golang.org/grpc v1.64.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
-)
-
-replace (
-	github.com/miretskiy/dio => ../dio
-	github.com/pawelgaczynski/giouring => ../giouring
 )

@@ -108,6 +108,10 @@ github.com/googleapis/enterprise-certificate-proxy v0.3.2 h1:Vie5ybvEvT75RniqhfF
 github.com/googleapis/enterprise-certificate-proxy v0.3.2/go.mod h1:VLSiSSBs/ksPL8kq3OBOQ6WRI2QnaFynd1DCjZ62+V0=
 github.com/googleapis/gax-go/v2 v2.12.5 h1:8gw9KZK8TiVKB6q3zHY3SBzLnrGp6HQjyfYBYGmXdxA=
 github.com/googleapis/gax-go/v2 v2.12.5/go.mod h1:BUDKcWo+RaKq5SC9vVYL0wLADa3VcfswbOMMRmB9H3E=
+github.com/miretskiy/dio v0.0.0-20260304163557-43c87577baae h1:vr3HzOepWyUsndOrP+ua7wv/YsZ8wJqzjRm+1ITmz2Y=
+github.com/miretskiy/dio v0.0.0-20260304163557-43c87577baae/go.mod h1:2ppT166TiLboV5irGfsrYd78fJAVw58x/K0+hREnB9A=
+github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9 h1:Cu/CW2nKeqXinVjf5Bq1FeBD4jWG/msC5UazjjgAvsU=
+github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9/go.mod h1:HwOQqYv/WE3RMp4iTQsS6ou8WP3wKO9UXD0oDqB3NPU=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
