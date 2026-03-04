@@ -107,17 +107,28 @@ var serialFiles []struct{ name, key string }
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 
+// chunkConfig holds a pair of uring+pwrite engines for one chunk size.
+// The sub-benchmark name is e.g. "chunk=128K" or "chunk=4M".
+type chunkConfig struct {
+	name   string
+	uring  *cloudpump.Engine
+	pwrite *cloudpump.Engine
+}
+
 var (
-	uringEngine  *cloudpump.Engine
-	pwriteEngine *cloudpump.Engine
+	// chunkConfigs is populated in setupBench with one entry per chunk size.
+	// BenchmarkDownload / BenchmarkDownloadPwrite iterate over it.
+	chunkConfigs []chunkConfig
+
+	// serialEngine uses j=1 with the default (4M) chunk size.
 	serialEngine *cloudpump.Engine
 
-	uringS3  *awss3.Client
-	pwriteS3 *awss3.Client
+	// S3 clients.  All three share the same underlying HTTP transport
+	// (tuned for GOMAXPROCS concurrency); the only variable is auth.
+	uringS3  *awss3.Client // used by cloudpump benchmarks
+	pwriteS3 *awss3.Client // used by cloudpump pwrite benchmarks
+	naiveS3  *awss3.Client // used by GetObject and manager benchmarks
 
-	// naiveS3 is shared by both naive benchmarks; uses the same tuned HTTP
-	// transport as uringS3 so the comparison isolates I/O path, not transport.
-	naiveS3         *awss3.Client
 	naiveDownloader *s3manager.Downloader
 
 	benchDir     string
@@ -193,24 +204,31 @@ func setupBench() int {
 	}
 
 	// ── Engines ───────────────────────────────────────────────────────────────
-	uringEngine, err = cloudpump.NewEngine(cloudpump.WithChunkSize(4 << 20))
-	if err != nil {
-		slog.Error("uring engine", "err", err)
-		return 1
-	}
-
-	pwSched, err := iosched.NewPwriteScheduler()
-	if err != nil {
-		slog.Error("pwrite scheduler", "err", err)
-		return 1
-	}
-	pwriteEngine, err = cloudpump.NewEngine(
-		cloudpump.WithChunkSize(4<<20),
-		cloudpump.WithIOScheduler(pwSched),
-	)
-	if err != nil {
-		slog.Error("pwrite engine", "err", err)
-		return 1
+	// Build uring+pwrite engine pairs for each chunk size we want to benchmark.
+	for _, cs := range []int64{128 << 10, 4 << 20} {
+		uEng, uErr := cloudpump.NewEngine(cloudpump.WithChunkSize(cs))
+		if uErr != nil {
+			slog.Error("uring engine", "chunk", cs, "err", uErr)
+			return 1
+		}
+		pwSched, schErr := iosched.NewPwriteScheduler()
+		if schErr != nil {
+			slog.Error("pwrite scheduler", "err", schErr)
+			return 1
+		}
+		pEng, pErr := cloudpump.NewEngine(
+			cloudpump.WithChunkSize(cs),
+			cloudpump.WithIOScheduler(pwSched),
+		)
+		if pErr != nil {
+			slog.Error("pwrite engine", "chunk", cs, "err", pErr)
+			return 1
+		}
+		chunkConfigs = append(chunkConfigs, chunkConfig{
+			name:   fmt.Sprintf("chunk=%s", fmtBytes(cs)),
+			uring:  uEng,
+			pwrite: pEng,
+		})
 	}
 
 	serialEngine, err = cloudpump.NewEngine(
@@ -223,14 +241,17 @@ func setupBench() int {
 	}
 
 	// ── S3 clients ────────────────────────────────────────────────────────────
+	// All clients share the HTTP transport from the first (128K) uring engine;
+	// concurrency tuning is independent of chunk size.
+	sharedHTTP := chunkConfigs[0].uring.HTTPClient()
 	uringS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
-		o.HTTPClient = uringEngine.HTTPClient()
+		o.HTTPClient = sharedHTTP
 	})
 	pwriteS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
-		o.HTTPClient = pwriteEngine.HTTPClient()
+		o.HTTPClient = sharedHTTP
 	})
 	naiveS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
-		o.HTTPClient = uringEngine.HTTPClient()
+		o.HTTPClient = sharedHTTP
 	})
 	naiveDownloader = s3manager.NewDownloader(naiveS3, func(d *s3manager.Downloader) {
 		d.PartSize    = int64(4 << 20)
@@ -258,10 +279,12 @@ func setupBench() int {
 }
 
 func teardownBench() {
-	for _, eng := range []*cloudpump.Engine{uringEngine, pwriteEngine, serialEngine} {
-		if eng != nil {
-			_ = eng.Close()
-		}
+	for _, cc := range chunkConfigs {
+		_ = cc.uring.Close()
+		_ = cc.pwrite.Close()
+	}
+	if serialEngine != nil {
+		_ = serialEngine.Close()
 	}
 	if benchTempDir && benchDir != "" {
 		_ = os.RemoveAll(benchDir)
@@ -373,18 +396,28 @@ func managerDownload(ctx context.Context, key, dst string) error {
 // ─── BenchmarkDownload (io_uring / best scheduler) ───────────────────────────
 
 // BenchmarkDownload uses cloudpump with the best available I/O scheduler
-// (io_uring on Linux ≥5.1, pwrite(2) elsewhere).
+// (io_uring on Linux ≥5.1, pwrite(2) elsewhere), across all configured
+// chunk sizes. Sub-benchmark names: chunk=128K/20MB, chunk=4M/20MB, …
 func BenchmarkDownload(b *testing.B) {
-	runDownloadBench(b, uringEngine, uringS3, benchFiles)
+	for _, cc := range chunkConfigs {
+		cc := cc
+		b.Run(cc.name, func(b *testing.B) {
+			runDownloadBench(b, cc.uring, uringS3, benchFiles)
+		})
+	}
 }
 
 // ─── BenchmarkDownloadPwrite (forced pwrite) ─────────────────────────────────
 
-// BenchmarkDownloadPwrite forces pwrite(2) regardless of io_uring availability.
-// Comparing to BenchmarkDownload answers: "does io_uring batching reduce
-// syscall overhead enough to matter for this workload?"
+// BenchmarkDownloadPwrite forces pwrite(2) regardless of io_uring availability,
+// across all configured chunk sizes.
 func BenchmarkDownloadPwrite(b *testing.B) {
-	runDownloadBench(b, pwriteEngine, pwriteS3, benchFiles)
+	for _, cc := range chunkConfigs {
+		cc := cc
+		b.Run(cc.name, func(b *testing.B) {
+			runDownloadBench(b, cc.pwrite, pwriteS3, benchFiles)
+		})
+	}
 }
 
 // ─── BenchmarkDownloadSerial (j=1, O_DIRECT isolation) ───────────────────────
@@ -492,6 +525,19 @@ func mustRemove(b *testing.B, path string) {
 func dirExists(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
+}
+
+// fmtBytes formats a byte count as a compact human-readable string used in
+// sub-benchmark names: 131072 → "128K", 4194304 → "4M".
+func fmtBytes(n int64) string {
+	switch {
+	case n%(1<<20) == 0:
+		return fmt.Sprintf("%dM", n>>20)
+	case n%(1<<10) == 0:
+		return fmt.Sprintf("%dK", n>>10)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // ─── CPU time via getrusage ───────────────────────────────────────────────────
