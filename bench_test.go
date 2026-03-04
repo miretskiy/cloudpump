@@ -6,12 +6,21 @@
 //   - BenchmarkDownload        cloudpump, best scheduler (io_uring on Linux)
 //   - BenchmarkDownloadPwrite  cloudpump, forced pwrite(2) — isolates io_uring benefit
 //   - BenchmarkDownloadSerial  cloudpump, j=1 — isolates O_DIRECT + mmap benefit
-//   - BenchmarkDownloadNaive   single GetObject → io.Copy → os.Create baseline
+//   - BenchmarkDownloadNaive   single GetObject → io.Copy → os.Create + Sync baseline
 //
-// Every benchmark:
-//   - reports MB/s via b.SetBytes
-//   - runs vmstat(1) in the background and reports cs/s, sys%, blocked-procs
-//   - reports io_uring batch stats where applicable (avg-batch, max-batch)
+// Every benchmark reports:
+//   - MB/s via b.SetBytes
+//   - vmstat(1) system metrics: cs/s, blk-procs, cpu-usr%, cpu-sys%
+//   - process-level CPU time via getrusage(RUSAGE_SELF): cpu-usr-ms/op, cpu-sys-ms/op
+//   - io_uring batch stats where applicable: uring-avg-batch, uring-max-batch
+//
+// # Fairness note
+//
+// BenchmarkDownloadNaive calls f.Sync() before Close(). Without it, the OS
+// defers NVMe writes to after the benchmark timer stops (data sits in the
+// dirty page cache). Sync() forces the NVMe write inline so both cloudpump
+// (O_DIRECT, always synchronous to NVMe) and naive measure the same thing:
+// time until the file is durably on disk.
 //
 // Suggested remote run:
 //
@@ -30,6 +39,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -245,8 +255,7 @@ func BenchmarkDownloadNaive(b *testing.B) {
 			size := headObject(b, naiveS3, bf.key)
 			b.SetBytes(size)
 			mon := startVmstat()
-			statsBefore := uringEngine.SchedStats() // not used for naive, zero delta expected
-			_ = statsBefore
+			ru0 := getrusage()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
@@ -258,7 +267,9 @@ func BenchmarkDownloadNaive(b *testing.B) {
 			}
 
 			b.StopTimer()
+			ru1 := getrusage()
 			reportVmstat(b, mon.stop())
+			reportCPU(b, ru0, ru1)
 		})
 	}
 }
@@ -286,6 +297,7 @@ func runDownloadBench(
 			// only the delta attributable to this sub-benchmark.
 			before := eng.SchedStats()
 			mon := startVmstat()
+			ru0 := getrusage()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
@@ -297,7 +309,9 @@ func runDownloadBench(
 			}
 
 			b.StopTimer()
+			ru1 := getrusage()
 			reportVmstat(b, mon.stop())
+			reportCPU(b, ru0, ru1)
 			reportUringStats(b, before, eng.SchedStats())
 		})
 	}
@@ -319,8 +333,15 @@ func naiveDownload(ctx context.Context, client *awss3.Client, bucket, key, dst s
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	if _, err = io.Copy(f, resp.Body); err != nil {
+		return err
+	}
+	// Sync flushes dirty pages to NVMe before returning so the benchmark
+	// measures the same thing as cloudpump's O_DIRECT writes: time until
+	// data is durably on disk. Without Sync, the OS defers the NVMe write
+	// to after the benchmark timer stops, making naive appear faster than
+	// it really is (it was measuring "time to fill page cache", not NVMe).
+	return f.Sync()
 }
 
 // ─── vmstat monitor ───────────────────────────────────────────────────────────
@@ -469,4 +490,38 @@ func mean(vs []float64) float64 {
 		sum += v
 	}
 	return sum / float64(len(vs))
+}
+
+// ─── CPU time via getrusage ───────────────────────────────────────────────────
+
+// getrusage returns the current process resource usage.
+// Uses RUSAGE_SELF so it captures all goroutines in this process, including
+// the io_uring coordinator goroutine and the Go runtime — giving the true
+// CPU cost of each download path.
+func getrusage() syscall.Rusage {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	return ru
+}
+
+// tvNanos converts a syscall.Timeval to nanoseconds.
+// Works on both Linux (int64 Usec) and Darwin (int32 Usec) by widening.
+func tvNanos(tv syscall.Timeval) int64 {
+	return int64(tv.Sec)*1e9 + int64(tv.Usec)*1e3
+}
+
+// reportCPU reports per-operation user-space and kernel CPU time.
+//
+// For io_uring vs pwrite: expect lower cpu-sys-ms/op with uring (batched
+// syscalls) but potentially higher cpu-usr-ms/op (coordinator goroutine +
+// channel overhead). The sum shows net CPU cost per download.
+//
+// For serial vs parallel: parallel has more total CPU (N goroutines) but
+// lower elapsed time; the per-op CPU numbers capture the true compute cost.
+func reportCPU(b *testing.B, before, after syscall.Rusage) {
+	b.Helper()
+	userNs := tvNanos(after.Utime) - tvNanos(before.Utime)
+	sysNs := tvNanos(after.Stime) - tvNanos(before.Stime)
+	b.ReportMetric(float64(userNs)/float64(b.N)/1e6, "cpu-usr-ms/op")
+	b.ReportMetric(float64(sysNs)/float64(b.N)/1e6, "cpu-sys-ms/op")
 }
