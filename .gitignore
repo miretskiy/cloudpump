@@ -1,0 +1,6 @@
+# Build outputs
+/cp
+/cloudpump
+
+# macOS
+.DS_Store
