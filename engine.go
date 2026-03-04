@@ -28,7 +28,7 @@
 // O_DIRECT requires write size and file offset to be multiples of 4 KiB.
 // The final chunk rarely satisfies this. The engine zero-pads the slab to the
 // next 4 KiB boundary, issues the block-aligned write, then calls
-// syscall.Ftruncate to restore the file's true logical size.
+// sys.Ftruncate to restore the file's true logical size.
 package cloudpump
 
 import (
@@ -327,7 +327,7 @@ func (e *Engine) Close() error {
 //  5. Spawn up to Engine.concurrency goroutines via errgroup.
 //  6. Each worker: pool.Acquire (back-pressure token) → fetchWithRetry →
 //     zero-pad tail → iosched.WriteAt → buf.Unpin.
-//  7. syscall.Ftruncate (O_DIRECT path only) to restore the true file size.
+//  7. sys.Ftruncate (O_DIRECT path only) to restore the file's true logical size.
 func (e *Engine) Download(ctx context.Context, src cloud.CloudChunkReader, dstPath string) (retErr error) {
 	// 1. Object size.
 	size, err := src.Size(ctx)
@@ -395,7 +395,7 @@ func (e *Engine) Download(ctx context.Context, src cloud.CloudChunkReader, dstPa
 	// metadata-only operation on a pre-allocated file — effectively free.
 	// Only needed when O_DIRECT was active (tail-padding was applied).
 	if directIO {
-		if err := syscall.Ftruncate(fd, size); err != nil {
+		if err := sys.Ftruncate(f, size); err != nil {
 			return fmt.Errorf("cloudpump: ftruncate %q to %d: %w", dstPath, size, err)
 		}
 	}
