@@ -284,6 +284,12 @@ func NewEngine(opts ...Option) (*Engine, error) {
 	return e, nil
 }
 
+// SchedStats returns a snapshot of the underlying I/O scheduler's statistics.
+// For URingScheduler: Batches, Requests, MaxBatch, AvgBatch, and latency
+// histograms are populated. For PwriteScheduler: only latency histograms.
+// Useful in benchmarks to measure io_uring batching efficiency.
+func (e *Engine) SchedStats() iosched.Stats { return e.sched.Stats() }
+
 // ChunkSize returns the configured chunk size in bytes.
 // Callers that create a CloudChunkWriter (e.g. S3MultipartWriter) need this
 // to validate provider-specific size constraints before Upload is called.
