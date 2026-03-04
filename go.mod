@@ -64,3 +64,7 @@ require (
 	google.golang.org/grpc v1.64.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )
+
+// Use local fork with Go 1.24+ fix for syscall.{mmap,munmap} linkname removal.
+// Remove once https://github.com/pawelgaczynski/giouring/pull/20 is merged and released.
+replace github.com/pawelgaczynski/giouring => ../giouring
