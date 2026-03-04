@@ -276,6 +276,14 @@ func NewEngine(opts ...Option) (*Engine, error) {
 				// Never transparently decompress: we download raw binary data
 				// and gzip injection breaks Range request semantics.
 				DisableCompression: true,
+				// Match the TLS rawInput pre-allocation so HTTP bufio reads
+				// are large enough to consume a full TLS record batch.
+				ReadBufferSize:  tlsRawInputBufSize,
+				WriteBufferSize: tlsRawInputBufSize,
+				// Pre-size tls.Conn.rawInput before handshake so the TLS layer
+				// issues large read syscalls instead of one per 16 KiB record.
+				// Remove once golang/go#47672 is resolved.
+				DialTLSContext: dialTLSWithLargeBuffer,
 			},
 		}
 	}
