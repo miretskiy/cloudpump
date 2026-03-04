@@ -10,7 +10,6 @@
 //
 // Every benchmark reports:
 //   - MB/s via b.SetBytes
-//   - vmstat(1) system metrics: cs/s, blk-procs, cpu-usr%, cpu-sys%
 //   - process-level CPU time via getrusage(RUSAGE_SELF): cpu-usr-ms/op, cpu-sys-ms/op
 //   - io_uring batch stats where applicable: uring-avg-batch, uring-max-batch
 //
@@ -29,23 +28,35 @@
 // f.Sync() is called after the download so both benchmarks measure the same
 // endpoint: data durably on NVMe (not merely in the dirty page cache).
 //
-// Suggested remote run:
+// # Recommended isolated run with external profiling (on NVMe-equipped Linux)
 //
+// Run each suite separately so S3 rate-limiting and OS cache state do not
+// bleed across suites. Lower perf_event_paranoid for hardware counters:
+//
+//	echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+//
+// Then for each suite (example for cloudpump pwrite):
+//
+//	iostat -dx nvme1n1 1 > /tmp/iostat-pwrite.txt &
+//	IOSTAT_PID=$!
 //	CLOUDPUMP_BENCH_DIR=/instance_storage \
-//	  go test -bench=. -benchtime=10x -count=1 -run='^$' -v .
+//	  perf stat -e cycles,instructions,cache-misses,cache-references, \
+//	            context-switches,page-faults,stalled-cycles-backend \
+//	  go test -bench='^BenchmarkDownloadPwrite$' -benchtime=10x -run='^$' \
+//	          -cpuprofile=/tmp/pwrite.prof . 2>&1 | tee /tmp/pwrite-bench.txt
+//	kill $IOSTAT_PID
+//
+//	# Analyse CPU profile
+//	go tool pprof -text -cum /tmp/pwrite.prof | head -40
 package cloudpump_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 
@@ -277,7 +288,6 @@ func BenchmarkDownloadNaive(b *testing.B) {
 			size := headObject(b, naiveS3, bf.key)
 			naiveDownloadKey = bf.key // thread key to naiveDownload via package var
 			b.SetBytes(size)
-			mon := startVmstat()
 			ru0 := getrusage()
 			b.ResetTimer()
 
@@ -291,7 +301,6 @@ func BenchmarkDownloadNaive(b *testing.B) {
 
 			b.StopTimer()
 			ru1 := getrusage()
-			reportVmstat(b, mon.stop())
 			reportCPU(b, ru0, ru1)
 		})
 	}
@@ -319,7 +328,6 @@ func runDownloadBench(
 			// Snapshot scheduler counters BEFORE the run so we compute
 			// only the delta attributable to this sub-benchmark.
 			before := eng.SchedStats()
-			mon := startVmstat()
 			ru0 := getrusage()
 			b.ResetTimer()
 
@@ -333,7 +341,6 @@ func runDownloadBench(
 
 			b.StopTimer()
 			ru1 := getrusage()
-			reportVmstat(b, mon.stop())
 			reportCPU(b, ru0, ru1)
 			reportUringStats(b, before, eng.SchedStats())
 		})
@@ -370,94 +377,6 @@ func naiveDownload(ctx context.Context, dst string) error {
 // thread it through a package-level variable (benchmarks are not concurrent).
 var naiveDownloadKey string
 
-// ─── vmstat monitor ───────────────────────────────────────────────────────────
-
-// vmstatMonitor runs `vmstat 1` in the background and collects samples.
-type vmstatMonitor struct {
-	cmd *exec.Cmd
-	buf bytes.Buffer
-}
-
-// startVmstat launches vmstat with 1-second intervals.
-// Returns nil (silently) if vmstat is not available (non-Linux).
-func startVmstat() *vmstatMonitor {
-	m := &vmstatMonitor{}
-	m.cmd = exec.Command("vmstat", "1")
-	m.cmd.Stdout = &m.buf
-	if err := m.cmd.Start(); err != nil {
-		return nil // vmstat not available
-	}
-	return m
-}
-
-func (m *vmstatMonitor) stop() vmstatSample {
-	if m == nil || m.cmd == nil {
-		return vmstatSample{}
-	}
-	_ = m.cmd.Process.Kill()
-	_ = m.cmd.Wait()
-	return parseVmstat(m.buf.String())
-}
-
-// vmstatSample holds per-second averages from vmstat output.
-type vmstatSample struct {
-	AvgCS      float64 // context switches / second
-	AvgBlocked float64 // processes blocked on I/O (b column)
-	AvgUserCPU float64 // user CPU %
-	AvgSysCPU  float64 // system CPU %
-}
-
-// parseVmstat parses `vmstat 1` output.
-//
-// vmstat column layout (17 fields):
-//
-//	r b swpd free buff cache si so bi bo in cs us sy id wa st
-//	0 1  2    3    4    5    6  7  8  9  10 11 12 13 14 15 16
-//
-// We skip the 2 header lines and the first data line (boot averages).
-func parseVmstat(output string) vmstatSample {
-	var cs, blocked, us, sy []float64
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	// lines[0] = "procs …" header
-	// lines[1] = "r  b  swpd …" header
-	// lines[2] = first data line (since-boot averages — skip)
-	// lines[3..] = 1-second samples
-	for _, line := range lines[3:] {
-		fields := strings.Fields(line)
-		if len(fields) < 17 {
-			continue
-		}
-		if v, err := strconv.ParseFloat(fields[1], 64); err == nil {
-			blocked = append(blocked, v)
-		}
-		if v, err := strconv.ParseFloat(fields[11], 64); err == nil {
-			cs = append(cs, v)
-		}
-		if v, err := strconv.ParseFloat(fields[12], 64); err == nil {
-			us = append(us, v)
-		}
-		if v, err := strconv.ParseFloat(fields[13], 64); err == nil {
-			sy = append(sy, v)
-		}
-	}
-	return vmstatSample{
-		AvgCS:      mean(cs),
-		AvgBlocked: mean(blocked),
-		AvgUserCPU: mean(us),
-		AvgSysCPU:  mean(sy),
-	}
-}
-
-func reportVmstat(b *testing.B, s vmstatSample) {
-	b.Helper()
-	if s.AvgCS == 0 && s.AvgSysCPU == 0 {
-		return // vmstat not available or no samples collected
-	}
-	b.ReportMetric(s.AvgCS, "cs/s")
-	b.ReportMetric(s.AvgBlocked, "blk-procs")
-	b.ReportMetric(s.AvgUserCPU, "cpu-usr%")
-	b.ReportMetric(s.AvgSysCPU, "cpu-sys%")
-}
 
 // ─── io_uring batch stats ─────────────────────────────────────────────────────
 
