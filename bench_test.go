@@ -1,62 +1,68 @@
-// Package cloudpump_test contains end-to-end download benchmarks against the
-// public NOAA GOES-16 S3 bucket (us-east-1, no AWS credentials required).
+// Package cloudpump_test contains end-to-end download benchmarks.
 //
-// Benchmark suites:
+// By default the benchmarks run against the public NOAA GOES-16 S3 bucket
+// (us-east-1, no credentials required).  Set CLOUDPUMP_BENCH_S3 to target
+// any other object:
 //
-//   - BenchmarkDownload        cloudpump, best scheduler (io_uring on Linux)
-//   - BenchmarkDownloadPwrite  cloudpump, forced pwrite(2) — isolates io_uring benefit
-//   - BenchmarkDownloadSerial  cloudpump, j=1 — isolates O_DIRECT + mmap benefit
-//   - BenchmarkDownloadNaive   AWS manager.Downloader (parallel, heap buffers, page cache)
+//	CLOUDPUMP_BENCH_S3=s3://dd-points-s-staging/<uuid>/v8_o2_....h5s \
+//	  go test -bench=. -benchtime=5x -run=^$ .
 //
-// Every benchmark reports:
+// When CLOUDPUMP_BENCH_S3 is set the benchmark uses standard AWS credential
+// resolution (env vars, ~/.aws/credentials, IMDS) instead of anonymous access.
+//
+// # Benchmark suites
+//
+//   - BenchmarkDownload          cloudpump, best scheduler (io_uring on Linux)
+//   - BenchmarkDownloadPwrite    cloudpump, forced pwrite(2)
+//   - BenchmarkDownloadSerial    cloudpump, j=1
+//   - BenchmarkDownloadManager   AWS manager.Downloader (parallel, heap buffers, page cache)
+//   - BenchmarkDownloadGetObject single GetObject → io.Copy (no range splitting)
+//
+// # What each benchmark measures
+//
+// BenchmarkDownloadGetObject: the absolute baseline. One HTTP request, one
+// streaming io.Copy into a page-cache-backed file. Bottlenecked by single-
+// stream TCP throughput; no parallelism overhead; lowest CPU of all methods.
+//
+// BenchmarkDownloadManager: AWS SDK parallel downloader. Splits the object
+// into 4 MiB parts (GOMAXPROCS parallel requests) and writes via f.WriteAt
+// into the page cache. Heap-allocates one buffer per part per round.
+//
+// BenchmarkDownload / BenchmarkDownloadPwrite: cloudpump with O_DIRECT,
+// pre-allocated mmap slabs, fallocate, and (on Linux) io_uring batching.
+// No page-cache involvement — data lands directly on NVMe.
+//
+// # Metrics reported per benchmark
+//
 //   - MB/s via b.SetBytes
-//   - process-level CPU time via getrusage(RUSAGE_SELF): cpu-usr-ms/op, cpu-sys-ms/op
-//   - io_uring batch stats where applicable: uring-avg-batch, uring-max-batch
+//   - cpu-usr-ms/op, cpu-sys-ms/op via getrusage(RUSAGE_SELF)
+//   - uring-avg-batch, uring-max-batch (cloudpump only, when io_uring active)
 //
-// # What BenchmarkDownloadNaive measures
-//
-// The "naive" baseline uses aws-sdk-go-v2's manager.Downloader configured with
-// the same concurrency (GOMAXPROCS) and chunk size (4 MiB) as cloudpump. The
-// HTTP transport is also identical. The only differences are:
-//
-//   - I/O path: manager writes via f.WriteAt (buffered, page cache) vs
-//     cloudpump's O_DIRECT pwrite/io_uring (bypasses page cache)
-//   - Memory: manager allocates heap buffers per chunk (GC-visible) vs
-//     cloudpump's pre-allocated mmap slabs (GC-invisible)
-//   - Pre-allocation: no Fallocate vs cloudpump's upfront extent reservation
-//
-// f.Sync() is called after the download so both benchmarks measure the same
-// endpoint: data durably on NVMe (not merely in the dirty page cache).
-//
-// # Recommended isolated run with external profiling (on NVMe-equipped Linux)
-//
-// Run each suite separately so S3 rate-limiting and OS cache state do not
-// bleed across suites. Lower perf_event_paranoid for hardware counters:
+// # Recommended isolated run (NVMe-equipped Linux)
 //
 //	echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-//
-// Then for each suite (example for cloudpump pwrite):
-//
-//	iostat -dx nvme1n1 1 > /tmp/iostat-pwrite.txt &
-//	IOSTAT_PID=$!
-//	CLOUDPUMP_BENCH_DIR=/instance_storage \
-//	  perf stat -e cycles,instructions,cache-misses,cache-references, \
-//	            context-switches,page-faults,stalled-cycles-backend \
-//	  go test -bench='^BenchmarkDownloadPwrite$' -benchtime=10x -run='^$' \
-//	          -cpuprofile=/tmp/pwrite.prof . 2>&1 | tee /tmp/pwrite-bench.txt
-//	kill $IOSTAT_PID
-//
-//	# Analyse CPU profile
-//	go tool pprof -text -cum /tmp/pwrite.prof | head -40
+//	for BENCH in BenchmarkDownloadGetObject BenchmarkDownloadManager \
+//	             BenchmarkDownload BenchmarkDownloadPwrite; do
+//	  iostat -dx nvme1n1 1 > /tmp/iostat-${BENCH}.txt &
+//	  CLOUDPUMP_BENCH_DIR=/instance_storage \
+//	  CLOUDPUMP_BENCH_S3=s3://dd-points-s-staging/<uuid>/v8_o2_...h5s \
+//	    perf stat -e cycles,instructions,cache-misses,page-faults \
+//	    go test -bench=^${BENCH}$ -benchtime=10x -run=^$ \
+//	            -cpuprofile=/tmp/${BENCH}.prof . 2>&1 | tee /tmp/${BENCH}.txt
+//	  kill %1
+//	done
 package cloudpump_test
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -72,16 +78,19 @@ import (
 
 // ─── Corpus ───────────────────────────────────────────────────────────────────
 
-const (
+// benchBucket / benchRegion may be overridden by CLOUDPUMP_BENCH_S3.
+var (
 	benchBucket = "noaa-goes16"
 	benchRegion = "us-east-1"
 )
 
-// benchFiles is the full NOAA GOES-16 corpus: 10 MB → 90 MB in ~10 MB steps.
-var benchFiles = []struct {
-	name string
-	key  string
-}{
+// benchFiles is the corpus used by all benchmarks. Populated by setupBench:
+// either the public NOAA GOES-16 multi-file set, or a single object from
+// CLOUDPUMP_BENCH_S3.
+var benchFiles []struct{ name, key string }
+
+// noaaBenchFiles is the default NOAA corpus: 10 MB → 90 MB in ~10 MB steps.
+var noaaBenchFiles = []struct{ name, key string }{
 	{"10MB", "ABI-L2-CMIPF/2024/001/23/OR_ABI-L2-CMIPF-M6C06_G16_s20240012310206_e20240012319520_c20240012319563.nc"},
 	{"20MB", "ABI-L2-CMIPF/2024/001/19/OR_ABI-L2-CMIPF-M6C06_G16_s20240011930206_e20240011939520_c20240011939567.nc"},
 	{"30MB", "ABI-L2-CMIPF/2024/001/10/OR_ABI-L2-CMIPF-M6C01_G16_s20240011000208_e20240011009516_c20240011009574.nc"},
@@ -93,38 +102,21 @@ var benchFiles = []struct {
 	{"90MB", "ABI-L2-CMIPF/2024/001/17/OR_ABI-L2-CMIPF-M6C05_G16_s20240011740206_e20240011749514_c20240011749578.nc"},
 }
 
-// serialFiles is a subset used by BenchmarkDownloadSerial (j=1 is slow;
-// testing a range still covers small, medium, and large objects).
-var serialFiles = []struct{ name, key string }{
-	benchFiles[1], // 20MB
-	benchFiles[4], // 50MB
-	benchFiles[6], // 70MB
-	benchFiles[8], // 90MB
-}
+// serialFiles is the NOAA subset used by BenchmarkDownloadSerial (j=1 is slow).
+var serialFiles []struct{ name, key string }
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 
 var (
-	// uringEngine is the primary Engine; uses io_uring on Linux or pwrite fallback.
-	// All BenchmarkDownload iterations share this engine (pool pre-allocated once).
-	uringEngine *cloudpump.Engine
-
-	// pwriteEngine forces pwrite(2) regardless of io_uring availability.
-	// Identical settings to uringEngine except for the scheduler.
+	uringEngine  *cloudpump.Engine
 	pwriteEngine *cloudpump.Engine
-
-	// serialEngine uses j=1 to isolate the O_DIRECT + mmap benefit
-	// from the parallelism benefit.
 	serialEngine *cloudpump.Engine
 
-	// uringS3 / pwriteS3 are S3 clients whose HTTP transports are tuned to
-	// match their respective engine's concurrency.
 	uringS3  *awss3.Client
 	pwriteS3 *awss3.Client
 
-	// naiveS3 uses the same tuned transport as uringS3 so the HTTP path is
-	// identical. The only difference versus cloudpump is the I/O path:
-	// manager.Downloader writes through the page cache with heap buffers.
+	// naiveS3 is shared by both naive benchmarks; uses the same tuned HTTP
+	// transport as uringS3 so the comparison isolates I/O path, not transport.
 	naiveS3         *awss3.Client
 	naiveDownloader *s3manager.Downloader
 
@@ -164,18 +156,43 @@ func setupBench() int {
 	}
 	slog.Info("bench dir", "path", benchDir)
 
+	// ── Corpus and credentials ────────────────────────────────────────────────
+	// CLOUDPUMP_BENCH_S3=s3://bucket/key targets a private object instead of
+	// the default NOAA public corpus.
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(benchRegion),
-		config.WithCredentialsProvider(aws.AnonymousCredentials{}),
-	)
+	var cfgOpts []func(*config.LoadOptions) error
+	cfgOpts = append(cfgOpts, config.WithRegion(benchRegion))
+
+	if s3url := os.Getenv("CLOUDPUMP_BENCH_S3"); s3url != "" {
+		bucket, key, err := parseS3URL(s3url)
+		if err != nil {
+			slog.Error("CLOUDPUMP_BENCH_S3 parse error", "url", s3url, "err", err)
+			return 1
+		}
+		benchBucket = bucket
+		// Use standard credential resolution (env, ~/.aws, IMDS) for private buckets.
+		slog.Info("custom S3 target", "bucket", benchBucket, "key", key)
+		benchFiles = []struct{ name, key string }{{"custom", key}}
+		serialFiles = benchFiles
+	} else {
+		// Public NOAA bucket: anonymous access, no credentials needed.
+		cfgOpts = append(cfgOpts, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
+		benchFiles = noaaBenchFiles
+		serialFiles = []struct{ name, key string }{
+			noaaBenchFiles[1], // 20MB
+			noaaBenchFiles[4], // 50MB
+			noaaBenchFiles[6], // 70MB
+			noaaBenchFiles[8], // 90MB
+		}
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, cfgOpts...)
 	if err != nil {
 		slog.Error("aws config", "err", err)
 		return 1
 	}
 
 	// ── Engines ───────────────────────────────────────────────────────────────
-	// 4 MiB chunks: ≥3 parallel requests for even a 10 MB file.
 	uringEngine, err = cloudpump.NewEngine(cloudpump.WithChunkSize(4 << 20))
 	if err != nil {
 		slog.Error("uring engine", "err", err)
@@ -212,18 +229,30 @@ func setupBench() int {
 	pwriteS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
 		o.HTTPClient = pwriteEngine.HTTPClient()
 	})
-	// naiveS3 shares the engine's tuned HTTP transport so the comparison
-	// isolates I/O path (page cache vs O_DIRECT) not transport config.
 	naiveS3 = awss3.NewFromConfig(cfg, func(o *awss3.Options) {
 		o.HTTPClient = uringEngine.HTTPClient()
 	})
-	// naiveDownloader mirrors cloudpump's parallelism and chunk size so
-	// the only variables are: heap allocations vs mmap slabs, page-cache
-	// writes vs O_DIRECT, and no Fallocate vs upfront extent reservation.
 	naiveDownloader = s3manager.NewDownloader(naiveS3, func(d *s3manager.Downloader) {
-		d.PartSize    = int64(4 << 20)           // match cloudpump's chunk size
-		d.Concurrency = runtime.GOMAXPROCS(0)    // match cloudpump's worker count
+		d.PartSize    = int64(4 << 20)
+		d.Concurrency = runtime.GOMAXPROCS(0)
 	})
+
+	// When using a custom file, HEAD it once to get the real size and update
+	// the corpus entry name so the report shows e.g. "21MB" not "custom".
+	if len(benchFiles) == 1 && benchFiles[0].name == "custom" {
+		resp, err := naiveS3.HeadObject(ctx, &awss3.HeadObjectInput{
+			Bucket: aws.String(benchBucket),
+			Key:    aws.String(benchFiles[0].key),
+		})
+		if err != nil {
+			slog.Error("HeadObject custom file", "err", err)
+			return 1
+		}
+		if resp.ContentLength != nil {
+			benchFiles[0].name = fmt.Sprintf("%dMB", *resp.ContentLength>>20)
+			serialFiles = benchFiles
+		}
+	}
 
 	return 0
 }
@@ -239,61 +268,26 @@ func teardownBench() {
 	}
 }
 
-func dirExists(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && fi.IsDir()
-}
+// ─── BenchmarkDownloadGetObject (true naive baseline) ─────────────────────────
 
-// ─── BenchmarkDownload (io_uring / best scheduler) ───────────────────────────
-
-// BenchmarkDownload uses the cloudpump engine with the best available I/O
-// scheduler (io_uring on Linux ≥5.1, pwrite(2) elsewhere). Reports MB/s,
-// io_uring batch stats, and vmstat system metrics.
-func BenchmarkDownload(b *testing.B) {
-	runDownloadBench(b, uringEngine, uringS3, benchFiles[:])
-}
-
-// ─── BenchmarkDownloadPwrite (forced pwrite) ─────────────────────────────────
-
-// BenchmarkDownloadPwrite is identical to BenchmarkDownload but uses
-// pwrite(2) unconditionally. Comparing the two answers: "does io_uring
-// batching reduce syscall overhead enough to matter for this workload?"
+// BenchmarkDownloadGetObject is the absolute baseline: one GetObject request,
+// one streaming io.Copy into a newly created file (page cache, no O_DIRECT).
 //
-// Expected: similar MB/s (NIC/NVMe bound), lower cs/s with io_uring.
-func BenchmarkDownloadPwrite(b *testing.B) {
-	runDownloadBench(b, pwriteEngine, pwriteS3, benchFiles[:])
-}
-
-// ─── BenchmarkDownloadSerial (j=1, O_DIRECT isolation) ───────────────────────
-
-// BenchmarkDownloadSerial restricts cloudpump to a single worker (j=1).
-// With parallelism removed, the comparison against BenchmarkDownloadNaive
-// isolates what O_DIRECT + pre-allocated mmap slabs contribute on their own.
-//
-// Expected: faster than Naive due to O_DIRECT avoiding page-cache pressure,
-// but far slower than the parallel BenchmarkDownload due to single TCP stream.
-func BenchmarkDownloadSerial(b *testing.B) {
-	runDownloadBench(b, serialEngine, uringS3, serialFiles[:])
-}
-
-// ─── BenchmarkDownloadNaive (io.Copy baseline) ───────────────────────────────
-
-// BenchmarkDownloadNaive is the baseline: a single GetObject → io.Copy →
-// os.Create pipeline. No range splitting, no O_DIRECT, no mmap, no io_uring.
-// The naiveS3 client uses the SDK's default http.Client (no tuning).
-func BenchmarkDownloadNaive(b *testing.B) {
+// This isolates single-stream TCP throughput with no range splitting,
+// no parallelism overhead, and minimal CPU overhead. Everything else
+// (manager, cloudpump) adds complexity to exceed this ceiling.
+func BenchmarkDownloadGetObject(b *testing.B) {
 	for _, bf := range benchFiles {
 		bf := bf
 		b.Run(bf.name, func(b *testing.B) {
 			size := headObject(b, naiveS3, bf.key)
-			naiveDownloadKey = bf.key // thread key to naiveDownload via package var
 			b.SetBytes(size)
 			ru0 := getrusage()
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				dst := dstPath(bf.name, "naive", i)
-				if err := naiveDownload(context.Background(), dst); err != nil {
+				dst := dstPath(bf.name, "getobj", i)
+				if err := getObjectDownload(context.Background(), bf.key, dst); err != nil {
 					b.Fatal(err)
 				}
 				mustRemove(b, dst)
@@ -306,11 +300,104 @@ func BenchmarkDownloadNaive(b *testing.B) {
 	}
 }
 
+// getObjectDownload fetches key with a single GetObject and streams it to dst
+// via io.Copy. No range splitting, no parallelism, no O_DIRECT.
+func getObjectDownload(ctx context.Context, key, dst string) error {
+	resp, err := naiveS3.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(benchBucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("GetObject: %w", err)
+	}
+	defer resp.Body.Close()
+
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err = io.Copy(f, resp.Body); err != nil {
+		return fmt.Errorf("io.Copy: %w", err)
+	}
+	return f.Sync()
+}
+
+// ─── BenchmarkDownloadManager (parallel manager, page cache) ─────────────────
+
+// BenchmarkDownloadManager uses aws-sdk-go-v2's manager.Downloader with the
+// same concurrency (GOMAXPROCS) and chunk size (4 MiB) as cloudpump.
+// Writes via f.WriteAt into the page cache with one heap buffer per chunk.
+// f.Sync() is called so both manager and cloudpump measure time until data
+// is durable on NVMe, not merely in dirty page cache.
+func BenchmarkDownloadManager(b *testing.B) {
+	for _, bf := range benchFiles {
+		bf := bf
+		b.Run(bf.name, func(b *testing.B) {
+			size := headObject(b, naiveS3, bf.key)
+			b.SetBytes(size)
+			ru0 := getrusage()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				dst := dstPath(bf.name, "mgr", i)
+				if err := managerDownload(context.Background(), bf.key, dst); err != nil {
+					b.Fatal(err)
+				}
+				mustRemove(b, dst)
+			}
+
+			b.StopTimer()
+			ru1 := getrusage()
+			reportCPU(b, ru0, ru1)
+		})
+	}
+}
+
+func managerDownload(ctx context.Context, key, dst string) error {
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err = naiveDownloader.Download(ctx, f, &awss3.GetObjectInput{
+		Bucket: aws.String(benchBucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		return fmt.Errorf("manager.Download: %w", err)
+	}
+	return f.Sync()
+}
+
+// ─── BenchmarkDownload (io_uring / best scheduler) ───────────────────────────
+
+// BenchmarkDownload uses cloudpump with the best available I/O scheduler
+// (io_uring on Linux ≥5.1, pwrite(2) elsewhere).
+func BenchmarkDownload(b *testing.B) {
+	runDownloadBench(b, uringEngine, uringS3, benchFiles)
+}
+
+// ─── BenchmarkDownloadPwrite (forced pwrite) ─────────────────────────────────
+
+// BenchmarkDownloadPwrite forces pwrite(2) regardless of io_uring availability.
+// Comparing to BenchmarkDownload answers: "does io_uring batching reduce
+// syscall overhead enough to matter for this workload?"
+func BenchmarkDownloadPwrite(b *testing.B) {
+	runDownloadBench(b, pwriteEngine, pwriteS3, benchFiles)
+}
+
+// ─── BenchmarkDownloadSerial (j=1, O_DIRECT isolation) ───────────────────────
+
+// BenchmarkDownloadSerial restricts cloudpump to a single worker (j=1).
+// With parallelism removed, comparison against BenchmarkDownloadGetObject
+// isolates what O_DIRECT + pre-allocated mmap slabs contribute on their own.
+func BenchmarkDownloadSerial(b *testing.B) {
+	runDownloadBench(b, serialEngine, uringS3, serialFiles)
+}
+
 // ─── Shared benchmark runner ──────────────────────────────────────────────────
 
-// runDownloadBench is the common body for all cloudpump download benchmarks.
-// It runs each file as a sub-benchmark, captures vmstat, and reports
-// io_uring batch stats (non-zero only when the engine uses URingScheduler).
 func runDownloadBench(
 	b *testing.B,
 	eng *cloudpump.Engine,
@@ -325,8 +412,6 @@ func runDownloadBench(
 			size := headObject(b, s3Client, bf.key)
 			b.SetBytes(size)
 
-			// Snapshot scheduler counters BEFORE the run so we compute
-			// only the delta attributable to this sub-benchmark.
 			before := eng.SchedStats()
 			ru0 := getrusage()
 			b.ResetTimer()
@@ -347,43 +432,8 @@ func runDownloadBench(
 	}
 }
 
-// ─── naiveDownload ────────────────────────────────────────────────────────────
-
-// naiveDownload uses manager.Downloader with the same concurrency and chunk
-// size as cloudpump. The manager writes via f.WriteAt — buffered page-cache
-// writes — whereas cloudpump uses O_DIRECT. This isolates the I/O path
-// difference with all other variables (HTTP transport, parallelism, chunk
-// size) held constant.
-//
-// f.Sync() is called so the benchmark measures time until data is on NVMe,
-// not merely time until dirty pages are in the kernel's page cache.
-func naiveDownload(ctx context.Context, dst string) error {
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err = naiveDownloader.Download(ctx, f, &awss3.GetObjectInput{
-		Bucket: aws.String(benchBucket),
-		Key:    aws.String(naiveDownloadKey),
-	}); err != nil {
-		return fmt.Errorf("manager.Download: %w", err)
-	}
-	return f.Sync()
-}
-
-// naiveDownloadKey is set by BenchmarkDownloadNaive before each sub-benchmark.
-// The manager.Downloader doesn't take the key at construction time, so we
-// thread it through a package-level variable (benchmarks are not concurrent).
-var naiveDownloadKey string
-
-
 // ─── io_uring batch stats ─────────────────────────────────────────────────────
 
-// reportUringStats computes the delta between before/after Stats snapshots and
-// reports io_uring batching efficiency. For PwriteScheduler, before.Batches
-// and after.Batches are both 0, so nothing is reported — which is intentional:
-// "no batch stats" is itself evidence that pwrite made no batching calls.
 func reportUringStats(b *testing.B, before, after iosched.Stats) {
 	b.Helper()
 	batches := after.Batches - before.Batches
@@ -391,15 +441,12 @@ func reportUringStats(b *testing.B, before, after iosched.Stats) {
 		return
 	}
 	requests := after.Requests - before.Requests
-	avgBatch := float64(requests) / float64(batches)
-	b.ReportMetric(avgBatch, "uring-avg-batch")
+	b.ReportMetric(float64(requests)/float64(batches), "uring-avg-batch")
 	b.ReportMetric(float64(after.MaxBatch), "uring-max-batch")
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// headObject calls HeadObject once (outside timing) to get the true file size
-// and pre-warm the TLS session. Skips the sub-benchmark on network error.
 func headObject(b *testing.B, client *awss3.Client, key string) int64 {
 	b.Helper()
 	resp, err := client.HeadObject(context.Background(), &awss3.HeadObjectInput{
@@ -415,8 +462,24 @@ func headObject(b *testing.B, client *awss3.Client, key string) int64 {
 	return *resp.ContentLength
 }
 
+func parseS3URL(s3url string) (bucket, key string, err error) {
+	u, err := url.Parse(s3url)
+	if err != nil {
+		return "", "", err
+	}
+	if u.Scheme != "s3" {
+		return "", "", fmt.Errorf("expected s3:// scheme, got %q", u.Scheme)
+	}
+	bucket = u.Host
+	key = strings.TrimPrefix(u.Path, "/")
+	if bucket == "" || key == "" {
+		return "", "", fmt.Errorf("invalid S3 URL: bucket=%q key=%q", bucket, key)
+	}
+	return bucket, key, nil
+}
+
 func dstPath(name, prefix string, i int) string {
-	return filepath.Join(benchDir, fmt.Sprintf("%s_%s_%d.nc", prefix, name, i))
+	return filepath.Join(benchDir, fmt.Sprintf("%s_%s_%d.bin", prefix, name, i))
 }
 
 func mustRemove(b *testing.B, path string) {
@@ -426,43 +489,23 @@ func mustRemove(b *testing.B, path string) {
 	}
 }
 
-func mean(vs []float64) float64 {
-	if len(vs) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, v := range vs {
-		sum += v
-	}
-	return sum / float64(len(vs))
+func dirExists(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
 
 // ─── CPU time via getrusage ───────────────────────────────────────────────────
 
-// getrusage returns the current process resource usage.
-// Uses RUSAGE_SELF so it captures all goroutines in this process, including
-// the io_uring coordinator goroutine and the Go runtime — giving the true
-// CPU cost of each download path.
 func getrusage() syscall.Rusage {
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
 	return ru
 }
 
-// tvNanos converts a syscall.Timeval to nanoseconds.
-// Works on both Linux (int64 Usec) and Darwin (int32 Usec) by widening.
 func tvNanos(tv syscall.Timeval) int64 {
 	return int64(tv.Sec)*1e9 + int64(tv.Usec)*1e3
 }
 
-// reportCPU reports per-operation user-space and kernel CPU time.
-//
-// For io_uring vs pwrite: expect lower cpu-sys-ms/op with uring (batched
-// syscalls) but potentially higher cpu-usr-ms/op (coordinator goroutine +
-// channel overhead). The sum shows net CPU cost per download.
-//
-// For serial vs parallel: parallel has more total CPU (N goroutines) but
-// lower elapsed time; the per-op CPU numbers capture the true compute cost.
 func reportCPU(b *testing.B, before, after syscall.Rusage) {
 	b.Helper()
 	userNs := tvNanos(after.Utime) - tvNanos(before.Utime)
