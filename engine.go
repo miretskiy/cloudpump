@@ -48,6 +48,7 @@ import (
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
 	"github.com/miretskiy/dio/mempool"
+	"github.com/miretskiy/dio/netbuf"
 	"github.com/miretskiy/dio/sys"
 )
 
@@ -278,12 +279,12 @@ func NewEngine(opts ...Option) (*Engine, error) {
 				DisableCompression: true,
 				// Match the TLS rawInput pre-allocation so HTTP bufio reads
 				// are large enough to consume a full TLS record batch.
-				ReadBufferSize:  tlsRawInputBufSize,
-				WriteBufferSize: tlsRawInputBufSize,
+				ReadBufferSize:  netbuf.TLSBufSize,
+				WriteBufferSize: netbuf.TLSBufSize,
 				// Pre-size tls.Conn.rawInput before handshake so the TLS layer
 				// issues large read syscalls instead of one per 16 KiB record.
 				// Remove once golang/go#47672 is resolved.
-				DialTLSContext: dialTLSWithLargeBuffer,
+				DialTLSContext: netbuf.DialTLSContext,
 			},
 		}
 	}

@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.11
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.3
-	github.com/miretskiy/dio v0.0.0-20260304211422-0acc2adedaf5
+	github.com/miretskiy/dio v0.0.0-20260304220015-6fb0bb1b240b
 	golang.org/x/sync v0.8.0
 	google.golang.org/api v0.187.0
 )
