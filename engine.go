@@ -38,7 +38,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"runtime"
 	"syscall"
 	"time"
@@ -342,8 +341,8 @@ func (e *Engine) Download(ctx context.Context, src cloud.CloudChunkReader, dstPa
 		return f.Close()
 	}
 
-	// 2. Open destination: try O_DIRECT, fall back on rejection.
-	f, directIO, err := openDst(dstPath)
+	// 2. Open destination with O_DIRECT (falls back to buffered on unsupported filesystems).
+	f, err := sys.CreateDirect(dstPath, sys.FlDirectIO)
 	if err != nil {
 		return fmt.Errorf("cloudpump: open %q: %w", dstPath, err)
 	}
@@ -381,7 +380,7 @@ func (e *Engine) Download(ctx context.Context, src cloud.CloudChunkReader, dstPa
 		chunkOff := off
 		chunkLen := min(e.chunkSize, size-chunkOff)
 		g.Go(func() error {
-			return e.writeChunk(gctx, src, fd, chunkOff, chunkLen, directIO)
+			return e.writeChunk(gctx, src, fd, chunkOff, chunkLen)
 		})
 	}
 
@@ -394,10 +393,8 @@ func (e *Engine) Download(ctx context.Context, src cloud.CloudChunkReader, dstPa
 	// align.PageAlign(lastChunkOffset + lastChunkLen). Ftruncate is a
 	// metadata-only operation on a pre-allocated file — effectively free.
 	// Only needed when O_DIRECT was active (tail-padding was applied).
-	if directIO {
-		if err := sys.Ftruncate(f, size); err != nil {
-			return fmt.Errorf("cloudpump: ftruncate %q to %d: %w", dstPath, size, err)
-		}
+	if err := sys.Ftruncate(f, size); err != nil {
+		return fmt.Errorf("cloudpump: ftruncate %q to %d: %w", dstPath, size, err)
 	}
 
 	runtime.KeepAlive(f)
@@ -414,7 +411,6 @@ func (e *Engine) writeChunk(
 	src cloud.CloudChunkReader,
 	fd int,
 	offset, length int64,
-	directIO bool,
 ) error {
 	// Back-pressure: block until a slab is available.
 	buf := e.pool.Acquire()
@@ -425,14 +421,15 @@ func (e *Engine) writeChunk(
 		return err
 	}
 
-	// Tail-padding for O_DIRECT: the final chunk is almost never
-	// block-aligned. Zero-fill slab[length:aligned] so we don't write
-	// stale data, then use the aligned length for the write call.
+	// Tail-padding: the final chunk is almost never block-aligned.
+	// Zero-fill slab[length:aligned] so we don't write stale data,
+	// then use the aligned length for the write call. Harmless in
+	// buffered mode; the subsequent Ftruncate corrects the file size.
 	// The slab always has capacity ≥ align.PageAlign(chunkSize) == chunkSize
 	// (chunkSize is block-aligned), so PageAlign(length) ≤ chunkSize and
 	// buf.Bytes()[:alignedLen] is always in-bounds.
 	writeLen := length
-	if directIO && length%align.BlockSize != 0 {
+	if length%align.BlockSize != 0 {
 		alignedLen := align.PageAlign(length)
 		clear(buf.Bytes()[int(length):int(alignedLen)])
 		writeLen = alignedLen
@@ -516,7 +513,7 @@ func fetchOnce(
 // before calling Upload, and for not calling dst.Commit or dst.Abort again.
 func (e *Engine) Upload(ctx context.Context, srcPath string, dst cloud.CloudChunkWriter) (retErr error) {
 	// 1. Open source.
-	f, directIO, err := openSrc(srcPath)
+	f, err := sys.OpenDirect(srcPath, sys.FlDirectIO)
 	if err != nil {
 		return fmt.Errorf("cloudpump: open source %q: %w", srcPath, err)
 	}
@@ -550,7 +547,7 @@ func (e *Engine) Upload(ctx context.Context, srcPath string, dst cloud.CloudChun
 		partNum++
 		pNum := partNum
 		g.Go(func() error {
-			return e.readAndUpload(gctx, dst, fd, chunkOff, chunkLen, pNum, directIO)
+			return e.readAndUpload(gctx, dst, fd, chunkOff, chunkLen, pNum)
 		})
 	}
 
@@ -583,13 +580,12 @@ func (e *Engine) readAndUpload(
 	fd int,
 	offset, length int64,
 	partNum int,
-	directIO bool,
 ) error {
 	buf := e.pool.Acquire()
 	defer buf.Unpin()
 
 	readLen := length
-	if directIO && length%align.BlockSize != 0 {
+	if length%align.BlockSize != 0 {
 		readLen = align.PageAlign(length)
 	}
 
@@ -606,44 +602,3 @@ func (e *Engine) readAndUpload(
 	return dst.WriteChunk(ctx, partNum, offset, buf.Bytes()[:int(length)])
 }
 
-// openSrc opens srcPath for reading with O_DIRECT, falling back to buffered
-// I/O if the filesystem rejects it. The directIO flag tells the caller
-// whether alignment padding is needed for reads.
-func openSrc(path string) (f *os.File, directIO bool, err error) {
-	f, err = sys.OpenDirect(path, sys.FlDirectIO)
-	if err == nil {
-		return f, true, nil
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) && (errno == syscall.EINVAL || errno == syscall.EOPNOTSUPP) {
-		f, err = sys.OpenDirect(path, sys.SyncNone)
-		if err != nil {
-			return nil, false, err
-		}
-		return f, false, nil
-	}
-	return nil, false, err
-}
-
-// openDst creates dstPath for writing and reports whether O_DIRECT is active.
-//
-// O_DIRECT is attempted first; if the filesystem rejects it (Linux EINVAL for
-// ZFS / tmpfs / overlayfs; EOPNOTSUPP for some network filesystems), the
-// function retries with standard buffered I/O and sets directIO=false.
-// The tail-padding logic and Ftruncate are skipped when directIO is false,
-// so correctness is preserved in the fallback path.
-func openDst(path string) (f *os.File, directIO bool, err error) {
-	f, err = sys.CreateDirect(path, sys.FlDirectIO)
-	if err == nil {
-		return f, true, nil
-	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) && (errno == syscall.EINVAL || errno == syscall.EOPNOTSUPP) {
-		f, err = sys.CreateDirect(path, sys.SyncNone)
-		if err != nil {
-			return nil, false, err
-		}
-		return f, false, nil
-	}
-	return nil, false, err
-}
