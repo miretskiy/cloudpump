@@ -205,7 +205,7 @@ func setupBench() int {
 
 	// ── Engines ───────────────────────────────────────────────────────────────
 	// Build uring+pwrite engine pairs for each chunk size we want to benchmark.
-	for _, cs := range []int64{128 << 10, 4 << 20} {
+	for _, cs := range []int64{128 << 10, 1 << 20, 4 << 20} {
 		uEng, uErr := cloudpump.NewEngine(cloudpump.WithChunkSize(cs))
 		if uErr != nil {
 			slog.Error("uring engine", "chunk", cs, "err", uErr)
