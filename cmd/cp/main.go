@@ -35,6 +35,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
@@ -56,7 +58,9 @@ func run() error {
 			"parallel chunk workers")
 		chunkSize = flag.Int64("c", 1<<20,
 			"chunk size in bytes (must be a multiple of 4096; ≥5 MiB for S3 uploads)")
-		maxRetries  = flag.Int("retries", 2, "extra retry attempts per chunk (0 = no retry)")
+		maxRetries   = flag.Int("retries", 2, "extra retry attempts per chunk (0 = no retry)")
+		readDeadline = flag.Duration("read-deadline", 0,
+			"per-read TCP deadline; detects stalled connections mid-body (0 = disabled, e.g. 30s)")
 		forceURing  = flag.Bool("uring", false, "use io_uring scheduler (Linux ≥5.1 only)")
 		forcePwrite = flag.Bool("pwrite", false, "use synchronous pwrite(2) scheduler")
 	)
@@ -103,6 +107,9 @@ func run() error {
 	}
 	if sched != nil {
 		opts = append(opts, cloudpump.WithIOScheduler(sched))
+	}
+	if *readDeadline > 0 {
+		opts = append(opts, cloudpump.WithReadDeadline(*readDeadline))
 	}
 	eng, err := cloudpump.NewEngine(opts...)
 	if err != nil {
@@ -186,6 +193,29 @@ func buildReader(
 		}
 		return cloud.NewGCSReader(gcsClient.Bucket(bucket).Object(object)), cloud.GCSIsRetryable, nil
 
+	case "az":
+		// az://container/path/to/blob
+		// Requires AZURE_STORAGE_ACCOUNT env var. Authentication uses the
+		// DefaultAzureCredential chain (managed identity, env vars, Azure CLI, …).
+		container, blobKey := u.Host, strings.TrimPrefix(u.Path, "/")
+		if container == "" || blobKey == "" {
+			return nil, nil, fmt.Errorf("invalid Azure URI %q: expected az://container/blob", uri)
+		}
+		account := os.Getenv("AZURE_STORAGE_ACCOUNT")
+		if account == "" {
+			return nil, nil, fmt.Errorf("AZURE_STORAGE_ACCOUNT env var not set")
+		}
+		blobURL := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", account, container, blobKey)
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("azure credential: %w", err)
+		}
+		blobClient, err := blob.NewClient(blobURL, cred, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("azure client: %w", err)
+		}
+		return cloud.NewAzureReader(blobClient), cloud.AzureIsRetryable, nil
+
 	default:
 		return nil, nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
@@ -252,5 +282,5 @@ func runUpload(ctx context.Context, eng *cloudpump.Engine, srcPath, dstURI strin
 
 // isCloudURI reports whether s looks like a cloud storage URI.
 func isCloudURI(s string) bool {
-	return strings.HasPrefix(s, "s3://") || strings.HasPrefix(s, "gs://")
+	return strings.HasPrefix(s, "s3://") || strings.HasPrefix(s, "gs://") || strings.HasPrefix(s, "az://")
 }

@@ -133,13 +133,16 @@ func ExponentialBackoff(base, max time.Duration) func(int) time.Duration {
 // Create a single Engine per process (or per storage tier) and reuse it
 // across downloads. Safe for concurrent use by multiple goroutines.
 type Engine struct {
-	pool        *mempool.MmapPool
-	ownPool     bool // true → Engine closes pool on Close()
-	sched       iosched.IOScheduler
-	httpClient  *http.Client
-	concurrency int
-	chunkSize   int64
-	retry       RetryPolicy
+	pool         *mempool.MmapPool
+	ownPool      bool // true → Engine closes pool on Close()
+	sched        iosched.IOScheduler
+	httpClient   *http.Client
+	concurrency  int
+	chunkSize    int64
+	retry        RetryPolicy
+	readDeadline time.Duration
+	hedge        HedgePolicy
+	ttfb         *ttfbTracker // non-nil when hedge.Threshold > 0
 }
 
 // Option is a functional option for configuring an [Engine].
@@ -202,6 +205,23 @@ func WithRetryPolicy(p RetryPolicy) Option {
 	return func(e *Engine) { e.retry = p }
 }
 
+// WithReadDeadline sets a per-call read deadline on every TCP connection used
+// for chunk downloads. Before each socket Read the deadline is reset to
+// now+d, so a connection that accepted TCP and returned the response header
+// but then stalls delivering body bytes is detected within d — rather than
+// waiting for an OS keepalive timeout (typically minutes).
+//
+// The resulting net.Error with Timeout() == true is classified as retryable
+// by [DefaultIsRetryable], so the chunk worker will reconnect from its point
+// of partial progress rather than retransmitting bytes already received.
+//
+// Zero (the default) disables per-read deadlines. For cloud storage, values
+// in the 10–30 s range provide a good balance between stall detection speed
+// and tolerance for momentarily slow connections.
+func WithReadDeadline(d time.Duration) Option {
+	return func(e *Engine) { e.readDeadline = d }
+}
+
 // NewEngine constructs and initialises an Engine.
 //
 // Unless [WithMmapPool] is provided, the engine creates its own
@@ -222,6 +242,11 @@ func NewEngine(opts ...Option) (*Engine, error) {
 	}
 	for _, o := range opts {
 		o(e)
+	}
+
+	// Initialise TTFB tracker now that all options have been applied.
+	if e.hedge.Threshold > 0 {
+		e.ttfb = newTTFBTracker()
 	}
 
 	if e.chunkSize%align.BlockSize != 0 {
@@ -281,10 +306,13 @@ func NewEngine(opts ...Option) (*Engine, error) {
 				// are large enough to consume a full TLS record batch.
 				ReadBufferSize:  netbuf.TLSBufSize,
 				WriteBufferSize: netbuf.TLSBufSize,
-				// Pre-size tls.Conn.rawInput before handshake so the TLS layer
-				// issues large read syscalls instead of one per 16 KiB record.
-				// Remove once golang/go#47672 is resolved.
-				DialTLSContext: netbuf.DialTLSContext,
+				// Apply per-Read deadline to plain-HTTP connections (used in
+				// tests and non-TLS endpoints). Zero readDeadline is a no-op.
+				DialContext: dialContext(e.readDeadline),
+				// Pre-size tls.Conn.rawInput (golang/go#47672) and, when
+				// WithReadDeadline > 0, enforce a per-Read deadline to detect
+				// body stalls. dialTLSContext supersedes netbuf.DialTLSContext.
+				DialTLSContext: dialTLSContext(e.readDeadline),
 			},
 		}
 	}
@@ -456,9 +484,16 @@ func (e *Engine) writeChunk(
 }
 
 // fetchWithRetry wraps the ReadChunk + io.ReadFull pair with the engine's
-// retry policy. On each attempt it opens a fresh range-read stream and
-// fills buf from byte zero, so partial reads from a failed attempt are
-// always overwritten.
+// retry policy. Each attempt resumes from where the previous one left off:
+// if n bytes were already written into buf, the next attempt opens a fresh
+// range-read starting at offset+n and fills buf[n:length]. This avoids
+// re-downloading bytes that were successfully received before a stall.
+//
+// Partial progress is possible whenever io.ReadFull returns a non-zero n
+// alongside an error — for example, a net.Error timeout from a deadlineConn
+// mid-body, or io.ErrUnexpectedEOF from a server that closed early.
+// DefaultIsRetryable classifies both as retryable, so the reconnect fires
+// automatically when WithReadDeadline or the server drop is the root cause.
 func (e *Engine) fetchWithRetry(
 	ctx context.Context,
 	src cloud.CloudChunkReader,
@@ -467,6 +502,7 @@ func (e *Engine) fetchWithRetry(
 ) error {
 	p := e.retry
 	var lastErr error
+	resumeAt := int64(0) // bytes already in buf from previous (partial) attempts
 	for attempt := 1; attempt <= p.MaxAttempts; attempt++ {
 		// Wait before retrying (skip on first attempt).
 		if attempt > 1 {
@@ -477,10 +513,12 @@ func (e *Engine) fetchWithRetry(
 			}
 		}
 
-		lastErr = fetchOnce(ctx, src, buf, offset, length)
-		if lastErr == nil {
+		n, err := e.fetchWithHedge(ctx, src, buf.Bytes()[int(resumeAt):int(length)], offset+resumeAt, length-resumeAt)
+		resumeAt += n
+		if err == nil {
 			return nil
 		}
+		lastErr = err
 		if !p.IsRetryable(lastErr) || ctx.Err() != nil {
 			break
 		}
@@ -489,21 +527,23 @@ func (e *Engine) fetchWithRetry(
 		offset, length, p.MaxAttempts, lastErr)
 }
 
-// fetchOnce opens a single range-read stream and reads exactly length bytes
-// into buf. The stream is always closed before returning.
+// fetchOnce opens a single range-read stream for [offset, offset+length) and
+// reads exactly len(dst) bytes into dst. The stream is always closed before
+// returning. Returns the number of bytes written into dst; on a partial read
+// (n < len(dst)) err is non-nil and buf[:n] holds the bytes already received.
 func fetchOnce(
 	ctx context.Context,
 	src cloud.CloudChunkReader,
-	buf *mempool.MmapBuffer,
+	dst []byte,
 	offset, length int64,
-) error {
+) (int64, error) {
 	stream, err := src.ReadChunk(ctx, offset, length)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer stream.Close()
-	_, err = io.ReadFull(stream, buf.Bytes()[:int(length)])
-	return err
+	n, err := io.ReadFull(stream, dst)
+	return int64(n), err
 }
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
